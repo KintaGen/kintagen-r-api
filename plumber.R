@@ -226,6 +226,28 @@ perform_nmr_analysis <- function(zip_file_path) {
   return(output_data)
 }
 
+# =========================================================================
+#  3. CORS FILTER
+#  This filter runs before any endpoint and adds the necessary headers
+#  to tell the browser that requests from your UI are allowed.
+# =========================================================================
+#* @filter cors
+function(req, res) {
+  # Set the permission slip header
+  res$setHeader("Access-Control-Allow-Origin", "*")
+
+  # Handle preflight OPTIONS requests
+  if (req$REQUEST_METHOD == "OPTIONS") {
+    res$setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+    res$setHeader("Access-Control-Allow-Headers", req$HTTP_ACCESS_CONTROL_REQUEST_HEADERS)
+    res$status <- 204 # No Content status
+    return(list())
+  }
+  
+  # Forward the request to the endpoint
+  plumber::forward()
+}
+
 #* Liveness check to confirm the API is running
 #* @get /healthcheck
 function() {
