@@ -114,7 +114,6 @@ function(req) {
     library(ggplot2)
     library(Spectra)
     library(dplyr)
-    library(plotly)
     library(mzR)
   })
   mzml_file <- req$body$file

@@ -97,7 +97,7 @@ perform_ms_analysis <- function(mzMl_file_path) {
 
     # Convert to plotly JSON and store it
     # This JSON can be directly fed into Plotly.js in the frontend
-    output_data$results$interactive_tic_plot_json <- plotly_json(p_interactive, pretty = FALSE)
+    output_data$results$interactive_tic_plot_json <- plotly::plotly_json(p_interactive, pretty = FALSE)
     log_message("Interactive plot JSON created.")
     
   }, error = function(e) {
