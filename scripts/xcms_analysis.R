@@ -85,19 +85,8 @@ perform_ms_analysis <- function(mzMl_file_path) {
       tic = tic(exp_spectra)
     )
     
-    # Build the ggplot object (it will be converted to JSON later)
-    p_interactive <- ggplot(spectra_summary, aes(x = rt_sec / 60, y = tic)) +
-      geom_line(color = "steelblue") +
-      labs(
-        title = "Interactive MS2 TIC",
-        x = "Retention Time (minutes)",
-        y = "Total Ion Count (TIC)"
-      ) +
-      theme_bw()
 
-    # Convert to plotly JSON and store it
-    # This JSON can be directly fed into Plotly.js in the frontend
-    output_data$results$interactive_tic_plot_json <- plotly::plotly_json(p_interactive, pretty = FALSE)
+    output_data$results$tic_data <- spectra_summary
     log_message("Interactive plot JSON created.")
     
   }, error = function(e) {

@@ -27,8 +27,8 @@ RUN apt-get update -qq && apt-get install -y \
 RUN R -e '                                                               \
     install.packages(c(                                                  \
         "archive",                                                       \
-        "BiocManager", "devtools", "plumber", "drc", "jsonlite",         \
-        "ggplot2", "base64enc","plotly","dplyr"                          \
+        "BiocManager", "devtools", "plumber", "drc",                     \
+        "ggplot2", "base64enc","dplyr"                                   \
     ));                                                                  \
     BiocManager::install(c(                                              \
         "impute", "MassSpecWavelet", "pcaMethods",                       \
