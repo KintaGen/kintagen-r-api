@@ -1,8 +1,3 @@
-suppressPackageStartupMessages({
-  library(drc)
-  library(jsonlite)
-  library(ggplot2)
-})
 perform_drc_analysis <- function(input_csv_string) {
   # --- 1. Initialize the final output list and helpers ---
 

@@ -4,7 +4,6 @@
 # 1. Load libraries required for the API itself
 suppressPackageStartupMessages({
   library(plumber)
-  library(archive)
 })
 
 source("./scripts/drc_analysis.R")
@@ -50,6 +49,11 @@ function() {
 #* @param req The HTTP request object containing the raw CSV data in its body.
 #* @serializer unboxedJSON
 function(req) {
+  suppressPackageStartupMessages({
+    library(drc)
+    library(jsonlite)
+    library(ggplot2)
+  })
   # Get the raw CSV string from the request body
   input_data <- req$body
   # Call the dedicated analysis function from our other script
@@ -65,6 +69,14 @@ function(req) {
 #* @serializer unboxedJSON
 function(req) {
   # Your log shows the file data is in req$body$file
+
+  suppressPackageStartupMessages({
+    library(drc)
+    library(jsonlite)
+    library(ggplot2)
+    library(Rnmr1D)
+    library(archive)
+  })
   file_object <- req$body$file
   
   # A robust check
@@ -97,6 +109,14 @@ function(req) {
   # Plumber receives the file and saves it to a temporary location.
   # The 'mzml_file' argument is a list containing info about the upload.
   # The most important part is '$value', which is the path to the temp file.
+  suppressPackageStartupMessages({
+    library(jsonlite)
+    library(ggplot2)
+    library(Spectra)
+    library(dplyr)
+    library(plotly)
+    library(mzR)
+  })
   mzml_file <- req$body$file
   if (is.null(mzml_file)) {
     return(list(error = "No file was uploaded. Please include a file named 'mzml_file'."))

@@ -1,10 +1,3 @@
-suppressPackageStartupMessages({
-  library(drc)
-  library(jsonlite)
-  library(ggplot2)
-  library(Rnmr1D)
-})
-
 perform_nmr_analysis <- function(zip_file_path) {
 
   # --- Initialize the final output list and helpers ---
