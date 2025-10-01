@@ -12,8 +12,7 @@ source("./scripts/xcms_analysis.R")
 
 source("./scripts/nmr1d_analysis.R")
 
-
-
+source("./scripts/helpers.R")
 
 # =========================================================================
 #  3. CORS FILTER
@@ -24,7 +23,7 @@ source("./scripts/nmr1d_analysis.R")
 function(req, res) {
   # Set the permission slip header
   res$setHeader("Access-Control-Allow-Origin", "*")
-
+  
   # Handle preflight OPTIONS requests
   if (req$REQUEST_METHOD == "OPTIONS") {
     res$setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
@@ -88,8 +87,10 @@ function(req) {
   temp_zip_file_path <- tempfile(fileext = ".zip")
   writeBin(raw_zip_content, temp_zip_file_path)
   # Now we have what our analysis function needs: a path to the ZIP file.
-  results <- perform_nmr_analysis(temp_zip_file_path)
-  
+  results <- perform_nmr_analysis(
+    zip_file_path = temp_zip_file_path,
+    gg_to_base64_func = gg_to_base64
+  )  
   # Clean up the temporary file we created.
   unlink(temp_zip_file_path)
   
