@@ -51,7 +51,6 @@ function() {
 function(req) {
   suppressPackageStartupMessages({
     library(drc)
-    library(jsonlite)
     library(ggplot2)
   })
   # Get the raw CSV string from the request body
@@ -72,7 +71,6 @@ function(req) {
 
   suppressPackageStartupMessages({
     library(drc)
-    library(jsonlite)
     library(ggplot2)
     library(Rnmr1D)
     library(archive)
@@ -110,7 +108,6 @@ function(req) {
   # The 'mzml_file' argument is a list containing info about the upload.
   # The most important part is '$value', which is the path to the temp file.
   suppressPackageStartupMessages({
-    library(jsonlite)
     library(ggplot2)
     library(Spectra)
     library(dplyr)
