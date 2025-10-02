@@ -56,7 +56,8 @@ function(req) {
   input_data <- req$body
   # Call the dedicated analysis function from our other script
   results <- perform_drc_analysis(input_data)
-  
+  # Garbage clean
+  gc()
   # Return the results. Plumber handles the JSON conversion.
   return(results)
 }
@@ -69,7 +70,6 @@ function(req) {
   # Your log shows the file data is in req$body$file
 
   suppressPackageStartupMessages({
-    library(drc)
     library(ggplot2)
     library(Rnmr1D)
     library(archive)
@@ -93,7 +93,8 @@ function(req) {
   )  
   # Clean up the temporary file we created.
   unlink(temp_zip_file_path)
-  
+  # Garbage clean
+  gc()
   return(results)
 }
 
@@ -122,7 +123,8 @@ function(req) {
   
   writeBin(mzml_file$value, temp_mzml_file_path)  # Call the main analysis function with the path to the temporary file
   results <- perform_ms_analysis(temp_mzml_file_path)
-  
+  # Garbage clean
+  gc()
   # Plumber will automatically clean up the temporary file after the request is finished.
   return(results)
 }
