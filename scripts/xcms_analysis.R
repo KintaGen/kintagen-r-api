@@ -84,7 +84,13 @@ perform_ms_analysis <- function(mzMl_file_path) {
 
   # --- 4. GENERATE TOP 5 SPECTRA PLOT (BASE64 ENCODED) ---
   tryCatch({
-    log_message("Generating normalized static plot of top 5 spectra...")
+    log_message("Generating annotated static plot of top 5 spectra...")
+    
+    # <<< --- CONTROL PLOT DIMENSIONS HERE --- >>>
+    # These values are in inches. Increase `plot_height_in` to make the plot taller.
+    plot_width_in <- 8
+    plot_height_in <- 12 # Taller than it is wide, good for a single column layout
+    plot_dpi <- 150      # Resolution in dots per inch
     
     num_features_to_plot <- min(5, nrow(output_data$results$top_features))
     if (num_features_to_plot == 0) {
@@ -94,39 +100,100 @@ perform_ms_analysis <- function(mzMl_file_path) {
     top_spectra <- exp_spectra[top_indices]
     
     peaks_list <- peaksData(top_spectra)
-    plot_df_list <- lapply(1:num_features_to_plot, function(i) {
+    
+    results_list <- lapply(1:num_features_to_plot, function(i) {
       df <- as.data.frame(peaks_list[[i]])
       colnames(df) <- c("mz", "intensity")
       
-      if (nrow(df) > 0 && max(df$intensity) > 0) {
+      if (nrow(df) > 0 && max(df$intensity, na.rm = TRUE) > 0) {
         df <- df %>%
-          mutate(relative_intensity = (intensity / max(intensity)) * 100) %>%
+          mutate(relative_intensity = (intensity / max(intensity, na.rm = TRUE)) * 100) %>%
           filter(relative_intensity >= 1.0)
       } else {
         df$relative_intensity <- numeric(0)
       }
 
-      df$label <- paste0(
-        "#", i, " @ ", round(rtime(top_spectra[i])/60, 2), " min\n",
-        "Precursor: ", round(precursorMz(top_spectra[i]), 4)
+      facet_label <- paste0(
+        "#", i, " @ ", round(rtime(top_spectra[i])/60, 2), " min\n"
       )
-      return(df)
+      df$label <- facet_label
+
+      peaks_to_label_df <- data.frame()
+      if (nrow(df) > 0) {
+        molecular_ion_peak <- df %>% 
+          arrange(desc(mz)) %>% 
+          head(1) %>%
+          mutate(peak_type = "Molecular Ion")
+
+        fragment_peaks <- df %>%
+          filter(mz != molecular_ion_peak$mz) %>%
+          arrange(desc(relative_intensity)) %>%
+          head(3) %>%
+          mutate(peak_type = "Fragment")
+        
+        peaks_to_label_df <- rbind(molecular_ion_peak, fragment_peaks) %>%
+          mutate(mz_label = format(round(mz, 2), nsmall = 2))
+      }
+      
+      return(list(
+        main_data = df, 
+        label_data = peaks_to_label_df
+      ))
     })
-    combined_plot_df <- do.call(rbind, plot_df_list)
-    
+
+    combined_plot_df <- do.call(rbind, lapply(results_list, `[[`, "main_data"))
+    combined_label_df <- do.call(rbind, lapply(results_list, `[[`, "label_data"))
+
     p_static <- ggplot(combined_plot_df, aes(x = mz, xend = mz, y = 0, yend = relative_intensity)) +
-      geom_segment(linewidth = 0.7) +
-      facet_wrap(~label) + 
+      geom_segment(linewidth = 0.7, color = "gray20") +
+      
+      geom_text(
+        data = combined_label_df,
+        aes(x = mz, y = relative_intensity, label = mz_label, color = peak_type),
+        angle = 45,
+        hjust = -0.1,
+        vjust = -0.2,
+        size = 2.8,
+        fontface = "bold",
+        show.legend = FALSE
+      ) +
+      
+      scale_color_manual(values = c("Fragment" = "goldenrod3", "Molecular Ion" = "firebrick")) +
+      
+      # Changed to 1 column to take advantage of vertical space
+      facet_wrap(~label, ncol = 1) + 
+      
       labs(
         title = "Top 5 Most Intense Fragmentation Spectra", 
         x = "m/z", 
         y = "Relative Intensity (%)" 
       ) +
       theme_bw() +
-      coord_cartesian(ylim = c(0, 110)) +
-      theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+      coord_cartesian(ylim = c(0, 150), expand = TRUE) + 
+      theme(
+        plot.title = element_text(hjust = 0.5, face = "bold")
+      )
       
-    output_data$results$top_5_spectra_plot_b64 <- gg_to_base64(p_static)
+    # Explicitly save the plot and encode to Base64 
+    temp_plot_file <- tempfile(fileext = ".png")
+    
+    log_message(sprintf("Saving plot with dimensions: width=%.1f in, height=%.1f in", plot_width_in, plot_height_in))
+    
+    ggplot2::ggsave(
+      filename = temp_plot_file,
+      plot = p_static,
+      width = plot_width_in,
+      height = plot_height_in,
+      dpi = plot_dpi,
+      units = "in"
+    )
+    
+    # Read the file and encode it
+    output_data$results$top_5_spectra_plot_b64 <- base64enc::dataURI(file = temp_plot_file, mime = "image/png")
+    
+    # Clean up the temporary file
+    unlink(temp_plot_file)
+    
     log_message("Static plot generation complete.")
 
   }, error = function(e) {
