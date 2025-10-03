@@ -1,24 +1,16 @@
+suppressPackageStartupMessages({
+  library(jsonlite)
+  library(Rnmr1D)
+  library(archive)
+  library(ggplot2)
+  library(dplyr)
+  library(tidyr)
+})
+source("./scripts/helpers.R")
+
 perform_nmr_analysis <- function(zip_file_path, gg_to_base64_func = NULL) {
   # --------------------------- Setup & guards ---------------------------------
-  output_data <- list(status = "processing", error = NULL, results = list())
   temp_unzip_dir <- NULL
-
-  log_message <- function(msg) cat(sprintf("%s - %s\n", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), msg))
-
-  need_pkgs <- c("Rnmr1D", "ggplot2", "dplyr", "tidyr")
-  for (p in need_pkgs) if (!requireNamespace(p, quietly = TRUE)) stop(sprintf("Package '%s' is required.", p))
-  `%>%` <- dplyr::`%>%`
-
-  if (is.null(gg_to_base64_func)) {
-    if (!requireNamespace("base64enc", quietly = TRUE)) stop("Provide gg_to_base64_func or install 'base64enc'.")
-    gg_to_base64_func <- function(p) {
-      tf <- tempfile(fileext = ".png")
-      ggplot2::ggsave(tf, plot = p, width = 11, height = 6, dpi = 150)
-      uri <- base64enc::dataURI(file = tf, mime = "image/png")
-      unlink(tf)
-      uri
-    }
-  }
 
   # ---------------------- Solvent reference (1H residuals) --------------------
   solvent_reference <- data.frame(
@@ -40,7 +32,6 @@ perform_nmr_analysis <- function(zip_file_path, gg_to_base64_func = NULL) {
     idx <- find_local_maxima(y)
     idx[y[idx] > (m + k * mad)]
   }
-  
   refine_peak_position <- function(full_spectrum_df, approx_ppm) {
     half_width_ppm <- 0.05
     peak_region <- full_spectrum_df %>%
@@ -62,6 +53,7 @@ perform_nmr_analysis <- function(zip_file_path, gg_to_base64_func = NULL) {
         return(NULL)
       }
     }
+
     log_message(sprintf("TMS Check: Found plausible candidate at %.4f ppm.", rightmost_peak$PPM))
     return(rightmost_peak)
   }
@@ -168,9 +160,9 @@ perform_nmr_analysis <- function(zip_file_path, gg_to_base64_func = NULL) {
   # ------------------------------ Main block ----------------------------------
   tryCatch({
     # ---- Unzip, Vendor Detection, Rnmr1D Processing ----
-    if (is.null(zip_file_path) || !file.exists(zip_file_path)) stop("No input ZIP file provided or found.")
     temp_unzip_dir <- tempfile("nmr_unzipped_"); dir.create(temp_unzip_dir, showWarnings = FALSE)
-    if (requireNamespace("archive", quietly = TRUE)) archive::archive_extract(archive = zip_file_path, dir = temp_unzip_dir)
+    
+    if (is.null(zip_file_path) || !file.exists(zip_file_path)) stop("No input ZIP file provided or found.")
     else utils::unzip(zip_file_path, exdir = temp_unzip_dir)
     log_message(sprintf("Unzipped into: %s", temp_unzip_dir))
 
@@ -344,4 +336,42 @@ perform_nmr_analysis <- function(zip_file_path, gg_to_base64_func = NULL) {
   })
 
   return(output_data)
+}
+
+# --- 3. Runner Block ---
+# This code only runs when the script is executed from the command line
+if (!interactive()) {
+  tryCatch({
+
+    # 1. Expect TWO arguments now: input and output paths
+    args <- commandArgs(trailingOnly = TRUE)
+    if (length(args) != 2) {
+      stop("Usage: Rscript <script_name>.R <input_path> <output_path>")
+    }
+    input_path <- args[1]
+    output_path <- args[2]
+
+    # This part is slightly different for DRC vs file-upload scripts
+    # --- For nmr1d_analysis.R and xcms_analysis.R ---
+    result <- perform_nmr_analysis( # or perform_ms_analysis
+      zip_file_path = input_path,  # or mzMl_file_path
+      gg_to_base64_func = gg_to_base64
+    )
+    # --- For drc_analysis.R, you would use this instead: ---
+    # csv_content <- readChar(input_path, file.info(input_path)$size)
+    # result <- perform_drc_analysis(csv_content)
+    
+    # 2. Convert result to JSON
+    json_output <- toJSON(result, auto_unbox = TRUE, pretty = TRUE)
+    
+    # 3. Write the JSON to the output file path provided by Node.js
+    write(json_output, file = output_path)
+
+  }, error = function(e) {
+    # If a catastrophic error happens, create an error JSON
+    error_json <- toJSON(list(status = "error", error = e$message), auto_unbox = TRUE)
+    # Try to write it to the output file so Node.js can report it
+    try(write(error_json, file = args[2]), silent = TRUE)
+    quit(status = 1) # Exit with an error code
+  })
 }

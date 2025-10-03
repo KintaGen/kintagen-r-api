@@ -1,3 +1,13 @@
+suppressPackageStartupMessages({
+  library(jsonlite)
+  library(Spectra)
+  library(mzR)
+  library(ggplot2)
+  library(dplyr)
+})
+source("./scripts/helpers.R")
+
+
 perform_ms_analysis <- function(mzMl_file_path) {
   
   # A simple helper function to find local maxima (peaks)
@@ -210,4 +220,33 @@ perform_ms_analysis <- function(mzMl_file_path) {
   }
   
   return(output_data)
+}
+
+if (!interactive()) {
+  tryCatch({
+
+    # 1. Expect TWO arguments: input and output paths
+    args <- commandArgs(trailingOnly = TRUE)
+    if (length(args) != 2) {
+      stop("Usage: Rscript xcms_analysis.R <input.mzML> <output.json>")
+    }
+    input_path <- args[1]
+    output_path <- args[2]
+
+    # The main analysis function expects the file path directly
+    result <- perform_ms_analysis(mzMl_file_path = input_path)
+    
+    # 2. Convert the result to JSON
+    json_output <- toJSON(result, auto_unbox = TRUE, pretty = TRUE)
+    
+    # 3. Write the JSON to the output file path provided by Node.js
+    write(json_output, file = output_path)
+
+  }, error = function(e) {
+    # If a catastrophic error happens, create an error JSON
+    error_json <- toJSON(list(status = "error", error = e$message), auto_unbox = TRUE)
+    # Try to write it to the output file so Node.js can report it
+    try(write(error_json, file = args[2]), silent = TRUE)
+    quit(status = 1) # Exit with an error code
+  })
 }

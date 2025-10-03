@@ -20,6 +20,7 @@ RUN apt-get update -qq && apt-get install -y \
     libxml2-dev \
     libcurl4-openssl-dev \
     libssl-dev \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # 3. Install all required R packages from CRAN and Bioconductor in one go.
@@ -27,7 +28,7 @@ RUN apt-get update -qq && apt-get install -y \
 RUN R -e '                                                               \
     install.packages(c(                                                  \
         "archive",                                                       \
-        "BiocManager", "devtools", "plumber", "drc",                     \
+        "BiocManager", "devtools", "drc",                                \
         "ggplot2", "base64enc","dplyr"                                   \
     ));                                                                  \
     BiocManager::install(c(                                              \
@@ -38,17 +39,19 @@ RUN R -e '                                                               \
 
 # 4. Install Rnmr1D from GitHub using devtools
 RUN R -e "devtools::install_github('INRA/Rnmr1D', dependencies = TRUE)"
-
-# 5. Copy your Plumber API script into the container's filesystem
-COPY plumber.R /app/plumber.R
-COPY scripts/* /app/scripts/
-
-# 6. Set the working directory inside the container
+#    Install Node.js and npm using the official NodeSource repository
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y nodejs
+# 5. Copy your API script into the container's filesystem
 WORKDIR /app
+COPY server.js /app/server.js
+COPY scripts/* /app/scripts/
+COPY package*.json /app
+RUN npm install
+# 6. Set the working directory inside the container
 
 # 7. Expose the port that the API will run on.
 EXPOSE 8000
 
-# 8. The command to run when the container starts. This starts the Plumber API server.
-#    Render will automatically use the PORT environment variable if set.
-CMD ["R", "-e", "port <- Sys.getenv('PORT', 8000); pr <- plumber::plumb('plumber.R'); pr$run(host='0.0.0.0', port=as.numeric(port))"]
+# 8. The command to run when the container starts. This starts the express API server.
+CMD ["node", "server.js"]

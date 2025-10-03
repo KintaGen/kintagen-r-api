@@ -1,8 +1,12 @@
+# --- 1. Load All Required Libraries and Helpers ---
+suppressPackageStartupMessages({
+  library(jsonlite)
+  library(drc)
+  library(ggplot2)
+})
+source("./scripts/helpers.R")
+
 perform_drc_analysis <- function(input_csv_string) {
-  # --- 1. Initialize the final output list and helpers ---
-
-  source("./scripts/helpers.R")
-
 
   # --- 1. HANDLE INPUT DATA ---
   tryCatch({
@@ -92,4 +96,36 @@ perform_drc_analysis <- function(input_csv_string) {
   }
   
   return(output_data)
+}
+
+# --- 3. Runner Block ---
+if (!interactive()) {
+  tryCatch({
+
+    # 1. Expect TWO arguments: input and output paths
+    args <- commandArgs(trailingOnly = TRUE)
+    if (length(args) != 2) {
+      stop("Usage: Rscript drc_analysis.R <input.csv> <output.json>")
+    }
+    input_path <- args[1]
+    output_path <- args[2]
+
+    # The main analysis function expects the raw CSV content, so we read it from the input file
+    csv_content <- readChar(input_path, file.info(input_path)$size)
+    result <- perform_drc_analysis(csv_content)
+    
+    # 2. Convert the result to JSON
+    json_output <- toJSON(result, auto_unbox = TRUE, pretty = TRUE)
+    
+    # 3. Write the JSON to the output file path provided by Node.js
+    write(json_output, file = output_path)
+
+  }, error = function(e) {
+    # If a catastrophic error happens, create an error JSON
+    error_json <- toJSON(list(status = "error", error = e$message), auto_unbox = TRUE)
+    # Try to write it to the output file so Node.js can report it
+    # Use args[2] because output_path might not be defined if the error was in argument parsing
+    try(write(error_json, file = args[2]), silent = TRUE)
+    quit(status = 1) # Exit with an error code
+  })
 }
