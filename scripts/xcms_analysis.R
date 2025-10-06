@@ -6,180 +6,224 @@ suppressPackageStartupMessages({
   library(ggplot2)
   library(dplyr)
   library(tidyr)
+  library(MsCoreUtils) # For smooth() and coefSG()
+  library(patchwork)   # For plot annotations
 })
 
 source("./scripts/helpers.R")
 
-perform_gcms_analysis <- function(mzMl_file_path) {
+perform_feature_analysis <- function(mzMl_file_path, noise_threshold_percent = 35.0) {
   
   output_data <- list(
     status = "processing",
+    mzMl_file_path = mzMl_file_path,
     results = list(),
     error = NULL
   )
-
-  # Helper function is unchanged
-  detect_and_integrate_peaks <- function(rt, intensity, noise_threshold_percent = 1.0) {
-    # ... (function code is identical)
-    if (length(rt) != length(intensity)) stop("Vectors must have the same length.")
-    max_intensity <- max(intensity, na.rm = TRUE)
-    if (max_intensity == 0) return(data.frame())
-    noise_threshold <- max_intensity * (noise_threshold_percent / 100)
+  
+  # Helper: empty peak table with required columns
+  empty_peaks_df <- function() {
+    data.frame(
+      rt_apex = numeric(),
+      rt_start = numeric(),
+      rt_end = numeric(),
+      peak_height = numeric(),
+      peak_area = numeric(),
+      stringsAsFactors = FALSE
+    )
+  }
+  
+  detect_and_integrate_peaks <- function(rt, intensity, noise_thresh,
+                                         min_width_sec = 3, min_prominence = NULL) {
+    stopifnot(length(rt) == length(intensity))
+    
+    # Local maxima (2nd-derivative sign change)
     is_peak <- which(diff(sign(diff(intensity))) == -2) + 1
-    apexes <- is_peak[intensity[is_peak] > noise_threshold]
-    if (length(apexes) == 0) return(data.frame())
+    apexes <- is_peak[intensity[is_peak] > noise_thresh]
+    if (length(apexes) == 0) return(empty_peaks_df())
+    
+    get_valley <- function(idx, dir){
+      j <- idx
+      while (j > 1 && j < length(intensity) &&
+             ((dir < 0 && intensity[j-1] <= intensity[j]) ||
+              (dir > 0 && intensity[j+1] <= intensity[j]))) {
+        j <- j + dir
+      }
+      j
+    }
+    
     peak_list <- lapply(apexes, function(apex_idx) {
-      left_idx <- apex_idx
-      while (left_idx > 1 && intensity[left_idx - 1] < intensity[left_idx] && intensity[left_idx - 1] >= noise_threshold) {
-        left_idx <- left_idx - 1
-      }
-      right_idx <- apex_idx
-      while (right_idx < length(intensity) && intensity[right_idx + 1] < intensity[right_idx] && intensity[right_idx + 1] >= noise_threshold) {
-        right_idx <- right_idx + 1
-      }
+      left_idx  <- get_valley(apex_idx, -1)
+      right_idx <- get_valley(apex_idx,  1)
       if (left_idx >= right_idx) return(NULL)
+      
+      # width & prominence filters
+      width_sec <- rt[right_idx] - rt[left_idx]
+      if (!is.null(min_width_sec) && width_sec < min_width_sec) return(NULL)
+      
+      left_min  <- min(intensity[left_idx:apex_idx], na.rm = TRUE)
+      right_min <- min(intensity[apex_idx:right_idx], na.rm = TRUE)
+      prom <- intensity[apex_idx] - max(left_min, right_min)
+      if (!is.null(min_prominence) && prom < min_prominence) return(NULL)
+      
+      # integrate (trapezoid)
       peak_indices <- left_idx:right_idx
       peak_rt <- rt[peak_indices]; peak_int <- intensity[peak_indices]
-      if(length(peak_rt) < 2) return(NULL)
+      if (length(peak_rt) < 2) return(NULL)
       peak_area <- sum(diff(peak_rt) * (peak_int[-1] + peak_int[-length(peak_int)]) / 2)
-      return(data.frame(rt_apex=rt[apex_idx], rt_start=rt[left_idx], rt_end=rt[right_idx], peak_height=intensity[apex_idx], peak_area=peak_area, integration_indices=I(list(peak_indices))))
+      
+      data.frame(
+        rt_apex = rt[apex_idx],
+        rt_start = rt[left_idx],
+        rt_end = rt[right_idx],
+        peak_height = intensity[apex_idx],
+        peak_area = peak_area,
+        stringsAsFactors = FALSE
+      )
     })
+    
     valid_peaks <- do.call(rbind, peak_list)
-    if (is.null(valid_peaks) || nrow(valid_peaks) == 0) return(data.frame())
-    return(valid_peaks %>% distinct(rt_start, rt_end, .keep_all = TRUE))
+    if (is.null(valid_peaks) || nrow(valid_peaks) == 0) return(empty_peaks_df())
+    dplyr::distinct(valid_peaks, rt_start, rt_end, .keep_all = TRUE)
   }
-
-  # --- 1. DATA LOADING AND PEAK PROCESSING ---
+  
+  # --- 1. DATA LOADING, SMOOTHING, AND PEAK PROCESSING ---
   tryCatch({
     log_message("Loading MS data and chromatogram...")
     exp_spectra <- Spectra(mzMl_file_path, backend = MsBackendMzR())
+    raw_chrom_data <- data.frame(rt_sec = rtime(exp_spectra), intensity = tic(exp_spectra))
     
-    chrom_data <- data.frame(rt_sec = rtime(exp_spectra), intensity = tic(exp_spectra))
-
-    log_message("Starting automated peak detection and integration...")
-    unprocessed_peaks_df <- detect_and_integrate_peaks(chrom_data$rt_sec, chrom_data$intensity, noise_threshold_percent = 1.0)
+    log_message("Smoothing chromatogram data...")
+    sg_coeffs <- MsCoreUtils::coefSG(hws = 5L, k = 3L)
+    smoothed_intensity <- MsCoreUtils::smooth(raw_chrom_data$intensity, cf = sg_coeffs)
+    smoothed_chrom_data <- raw_chrom_data
+    smoothed_chrom_data$intensity <- smoothed_intensity
     
-    if (nrow(unprocessed_peaks_df) == 0) stop("No peaks detected.")
+    # Threshold as % of smoothed max (same semantics as your original)
+    max_intensity_smoothed <- max(smoothed_intensity, na.rm = TRUE)
+    absolute_noise_threshold <- max_intensity_smoothed * (noise_threshold_percent / 100)
     
-    # <<< --- KEY CHANGE 1: NUMBER ALL PEAKS BY RETENTION TIME FIRST --- >>>
-    # This creates the definitive peak list that everything else will be based on.
-    all_peaks_numbered <- unprocessed_peaks_df %>%
-      arrange(rt_apex) %>%
-      mutate(peak_number = row_number())
-      
+    log_message(paste("Starting peak detection with", noise_threshold_percent, "% noise threshold..."))
+    all_peaks_numbered <- detect_and_integrate_peaks(
+      smoothed_chrom_data$rt_sec, smoothed_chrom_data$intensity, absolute_noise_threshold
+    )
+    # Safe even if empty because columns exist
+    all_peaks_numbered <- all_peaks_numbered %>% arrange(rt_apex) %>% mutate(peak_number = dplyr::row_number())
+    
     log_message(paste("Successfully integrated and numbered", nrow(all_peaks_numbered), "peaks."))
-    output_data$results$integrated_peaks <- all_peaks_numbered # Store this complete table
-
+    output_data$results$integrated_peaks <- all_peaks_numbered
+    output_data$results$smoothed_chrom_data_internal <- smoothed_chrom_data
+    
   }, error = function(e) {
     output_data$status <<- "error"; output_data$error <<- e$message; return(output_data)
   })
   if (!is.null(output_data$error)) return(output_data)
-
+  
   # --- 2. QUANTITATIVE REPORT & TOP FEATURE SELECTION ---
   tryCatch({
     log_message("Generating quantitative report...")
     all_peaks_numbered <- output_data$results$integrated_peaks
-    total_area <- sum(all_peaks_numbered$peak_area, na.rm = TRUE)
-    if (total_area == 0) stop("Total integrated area is zero.")
     
-    # The quant report is now directly created from the pre-numbered table
-    output_data$results$quantitative_report <- all_peaks_numbered %>%
-      mutate(
-        area_percent = (peak_area / total_area) * 100,
-        rt_minutes = round(rt_apex / 60, 3),
-        peak_area = round(peak_area, 0),
-        area_percent = round(area_percent, 2)
-      ) %>%
-      select(peak_number, rt_minutes, peak_area, area_percent)
-    
-    # <<< --- KEY CHANGE 2: SELECT TOP FEATURES BUT KEEP THEIR REAL PEAK NUMBER --- >>>
-    log_message("Identifying spectra for the top 5 most intense peaks...")
-    top_5_peaks_data <- all_peaks_numbered %>%
-      arrange(desc(peak_height)) %>%
-      head(5)
-
-    # Now, build the `top_features` object for the UI from this selection
-    all_runtimes_sec <- rtime(exp_spectra)
-    all_tics <- tic(exp_spectra)
-    max_tic_overall <- max(all_tics, na.rm = TRUE)
-    
-    top_features <- top_5_peaks_data %>%
-      rowwise() %>%
-      mutate(
-        spectrum_index = which.min(abs(all_runtimes_sec - rt_apex)),
-        retention_time_sec = all_runtimes_sec[spectrum_index],
-        absolute_tic = all_tics[spectrum_index],
-        relative_tic_percent = if(max_tic_overall > 0) (absolute_tic / max_tic_overall) * 100 else 0
-      ) %>%
-      ungroup() %>%
-      select(peak_number, spectrum_index, retention_time_sec, relative_tic_percent) # Keep peak_number!
-    
-    output_data$results$top_features <- top_features
-
+    if (nrow(all_peaks_numbered) == 0) {
+      log_message("No peaks were found. Skipping report generation.")
+      output_data$results$quantitative_report <- data.frame()
+      output_data$results$top_features <- data.frame()
+    } else {
+      total_area <- sum(all_peaks_numbered$peak_area, na.rm = TRUE)
+      output_data$results$quantitative_report <- all_peaks_numbered %>%
+        mutate(
+          area_percent = if (total_area > 0) (peak_area / total_area) * 100 else 0,
+          rt_minutes = round(rt_apex / 60, 3),
+          peak_area = round(peak_area, 0),
+          area_percent = round(area_percent, 2)
+        ) %>%
+        select(peak_number, rt_minutes, peak_area, area_percent)
+      
+      log_message("Identifying spectra for the top 50 most intense peaks...")
+      top_50_peaks_data <- all_peaks_numbered %>% arrange(desc(peak_height)) %>% head(50)
+      
+      if (nrow(top_50_peaks_data) == 0) {
+        output_data$results$top_features <- data.frame()
+      } else {
+        # map each apex to nearest spectrum by RT
+        spec_rt <- rtime(exp_spectra)
+        top_features <- top_50_peaks_data %>%
+          rowwise() %>%
+          mutate(spectrum_index = which.min(abs(spec_rt - rt_apex))) %>%
+          ungroup() %>%
+          select(peak_number, spectrum_index)
+        output_data$results$top_features <- top_features
+      }
+    }
   }, error = function(e) {
     output_data$status <<- "error"; output_data$error <<- e$message; return(output_data)
   })
   if (!is.null(output_data$error)) return(output_data)
-
-  # --- 3. GENERATE TOP 5 SPECTRA PLOT ---
+  
+  # --- 3. EXTRACT TOP 50 MASS SPECTRA DATA ---
   tryCatch({
-    log_message("Generating annotated static plot of top 5 spectra...")
+    log_message("Extracting mass spectra data for top 50 peaks...")
+    top_features_data <- output_data$results$top_features
     
-    top_features_to_plot <- output_data$results$top_features
-    if (nrow(top_features_to_plot) == 0) stop("No features found to plot.")
-    
-    top_indices <- top_features_to_plot$spectrum_index
-    top_spectra <- exp_spectra[top_indices]
-    
-    peaks_list <- peaksData(top_spectra)
-    results_list <- lapply(1:nrow(top_features_to_plot), function(i) {
-      df <- as.data.frame(peaks_list[[i]]); colnames(df) <- c("mz", "intensity")
+    if (!is.null(top_features_data) && nrow(top_features_data) > 0) {
+      top_spectra <- exp_spectra[top_features_data$spectrum_index]
+      peaks_list <- peaksData(top_spectra)
       
-      if (nrow(df) > 0 && max(df$intensity, na.rm = TRUE) > 0) {
-        df <- df %>% mutate(relative_intensity = (intensity / max(df$intensity, na.rm = TRUE)) * 100) %>% filter(relative_intensity >= 1.0)
-      } else { df$relative_intensity <- numeric(0) }
+      spectra_results_list <- lapply(seq_len(nrow(top_features_data)), function(i) {
+        peak_num <- top_features_data$peak_number[i]
+        pk <- peaks_list[[i]]
+        
+        if (is.null(pk) || length(pk) == 0) {
+          spec_data <- data.frame(mz = numeric(), relative_intensity = numeric())
+        } else {
+          spec_df <- as.data.frame(pk)
+          # Ensure there are at least two cols
+          if (ncol(spec_df) < 2) {
+            spec_data <- data.frame(mz = numeric(), relative_intensity = numeric())
+          } else {
+            colnames(spec_df)[1:2] <- c("mz", "intensity")
+            if (nrow(spec_df) > 0 && max(spec_df$intensity, na.rm = TRUE) > 0) {
+              spec_data <- spec_df %>%
+                mutate(relative_intensity = (intensity / max(intensity, na.rm = TRUE)) * 100) %>%
+                filter(relative_intensity >= 1.0) %>%
+                select(mz, relative_intensity)
+            } else {
+              spec_data <- data.frame(mz = numeric(), relative_intensity = numeric())
+            }
+          }
+        }
+        list(peak_number = peak_num, spectrum_data = spec_data)
+      })
       
-      # <<< --- KEY CHANGE 3: USE THE CORRECT PEAK NUMBER FOR THE LABEL --- >>>
-      # Instead of using the loop index `i`, we use the actual `peak_number` from our data.
-      correct_peak_number <- top_features_to_plot$peak_number[i]
-      retention_time_min <- round(top_features_to_plot$retention_time_sec[i] / 60, 2)
-      df$label <- paste0("#", correct_peak_number, " @ ", retention_time_min, " min")
-      
-      # ... rest of peak labeling logic is unchanged
-      peaks_to_label_df <- data.frame()
-      if (nrow(df) > 0) {
-        molecular_ion_peak <- df %>% arrange(desc(mz)) %>% head(1) %>% mutate(peak_type = "Molecular Ion")
-        fragment_peaks <- df %>% filter(mz != molecular_ion_peak$mz) %>% arrange(desc(relative_intensity)) %>% head(3) %>% mutate(peak_type = "Fragment")
-        peaks_to_label_df <- rbind(molecular_ion_peak, fragment_peaks) %>% mutate(mz_label = format(round(mz, 2), nsmall = 2))
-      }
-      return(list(main_data = df, label_data = peaks_to_label_df))
-    })
-    
-    combined_plot_df <- do.call(rbind, lapply(results_list, `[[`, "main_data"))
-    combined_label_df <- do.call(rbind, lapply(results_list, `[[`, "label_data"))
-    
-    p_static <- ggplot(combined_plot_df, aes(x=mz, xend=mz, y=0, yend=relative_intensity)) +
-      # ... ggplot layers are unchanged ...
-      geom_segment(linewidth=0.7, color="gray20") +
-      geom_text(data=combined_label_df, aes(x=mz, y=relative_intensity, label=mz_label, color=peak_type), angle=45, hjust=-0.1, vjust=-0.2, size=2.8, fontface="bold", show.legend=FALSE) +
-      scale_color_manual(values = c("Fragment"="goldenrod3", "Molecular Ion"="firebrick")) +
-      facet_wrap(~label, ncol=1) + 
-      labs(title="Spectra of Top 5 Most Intense Peaks", x="m/z", y="Relative Intensity (%)") +
-      theme_bw() + coord_cartesian(ylim=c(0, 150), expand=TRUE) + 
-      theme(plot.title=element_text(hjust=0.5, face="bold"))
-      
-    output_data$results$top_5_spectra_plot_b64 <- gg_to_base64(p_static, width = 8, height = 12)
-    log_message("Static spectra plot generation complete.")
-
+      output_data$results$top_spectra_data <- spectra_results_list
+    } else {
+      log_message("No top features found to extract spectra.")
+      output_data$results$top_spectra_data <- list()
+    }
   }, error = function(e) {
-    output_data$status <<- "error"; output_data$error <<- e$message
+    log_message(paste("Warning: Could not extract top spectra data:", e$message))
+    output_data$results$top_spectra_data <- list()
   })
-  if (!is.null(output_data$error)) return(output_data)
 
   # --- 4. FINALIZE AND RETURN ---
-  output_data$results$chromatogram_data <- chrom_data %>% mutate(rt_min = rt_sec/60) %>% select(rt_min, intensity)
-  output_data$results$integrated_peaks_details <- output_data$results$integrated_peaks %>% mutate(rt_apex_min = rt_apex/60, rt_start_min = rt_start/60, rt_end_min = rt_end/60, peak_height = peak_height)
+  # These use objects produced in the first tryCatch; if that failed, we'd have already returned.
+  output_data$results$raw_chromatogram_data <-
+    raw_chrom_data %>% mutate(rt_min = rt_sec/60) %>% select(rt_min, intensity)
+  output_data$results$smoothed_chromatogram_data <-
+    output_data$results$smoothed_chrom_data_internal %>% mutate(rt_min = rt_sec/60) %>% select(rt_min, intensity)
+  output_data$results$integrated_peaks_details <-
+    output_data$results$integrated_peaks %>%
+      mutate(
+        rt_apex_min = rt_apex/60,
+        rt_start_min = rt_start/60,
+        rt_end_min = rt_end/60,
+        peak_height = peak_height
+      )
+  
+  # Clean internals
   output_data$results$integrated_peaks <- NULL
+  output_data$results$smoothed_chrom_data_internal <- NULL
+  
   if (is.null(output_data$error)) { output_data$status <- "success" }
   return(output_data)
 }
@@ -187,15 +231,21 @@ perform_gcms_analysis <- function(mzMl_file_path) {
 # --- SCRIPT EXECUTION ---
 if (!interactive()) {
   tryCatch({
-      args <- commandArgs(trailingOnly = TRUE)
-      if (length(args) != 2) stop("Usage: Rscript <script.R> <input.mzML> <output.json>")
-      input_path <- args[1]; output_path <- args[2]
-      result <- perform_gcms_analysis(mzMl_file_path = input_path)
-      json_output <- toJSON(result, auto_unbox = TRUE, pretty = TRUE)
-      write(json_output, file = output_path)
+    args <- commandArgs(trailingOnly = TRUE)
+    if (length(args) < 2 || length(args) > 3) {
+      stop("Usage: Rscript feature_finder.R <input.mzML> <output.json> [noise_threshold_percent]")
+    }
+    input_path <- args[1]
+    output_path <- args[2]
+    noise_thresh <- if (length(args) == 3) as.numeric(args[3]) else 1.0
+    
+    result <- perform_feature_analysis(mzMl_file_path = input_path, noise_threshold_percent = noise_thresh)
+    json_output <- toJSON(result, auto_unbox = TRUE, pretty = TRUE)
+    write(json_output, file = output_path)
+    
   }, error = function(e) {
-      error_json <- toJSON(list(status = "error", error = e$message), auto_unbox = TRUE)
-      try(write(error_json, file = args[2]), silent = TRUE)
-      quit(status = 1)
+    error_json <- toJSON(list(status = "error", error = e$message), auto_unbox = TRUE)
+    try(write(error_json, file = commandArgs(trailingOnly=TRUE)[2]), silent = TRUE)
+    quit(status = 1)
   })
 }
