@@ -3,11 +3,9 @@ suppressPackageStartupMessages({
   library(jsonlite)
   library(Spectra)
   library(mzR)
-  library(ggplot2)
   library(dplyr)
   library(tidyr)
   library(MsCoreUtils) # For smooth() and coefSG()
-  library(patchwork)   # For plot annotations
 })
 
 source("./scripts/helpers.R")
