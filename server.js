@@ -17,7 +17,7 @@ app.use(cors());
 app.use(fileUpload({ limits: { fileSize: MAX_FILE_SIZE } }));
 app.use(express.text({ type: ['text/csv', 'text/plain'] }));
 app.use(express.json())
-// --- THIS IS YOUR ORIGINAL, UNTOUCHED HELPER FUNCTION ---
+
 function runRScriptSync(scriptName, inputFilePath) {
     const scriptPath = path.join(__dirname, 'scripts', scriptName);
     const outputFilePath = path.join(os.tmpdir(), `${uuidv4()}.json`);
@@ -40,8 +40,7 @@ function runRScriptSync(scriptName, inputFilePath) {
     }
 }
 
-// --- START: NEW HELPER FUNCTION (ADDITION ONLY) ---
-// This new function is specifically for the identifier script, which needs 3 arguments.
+
 function runIdentifierScriptSync(scriptName, initialJsonPath, outputPath) {
     const scriptPath = path.join(__dirname, 'scripts', scriptName);
     // Note the three arguments being passed
@@ -60,14 +59,12 @@ function runIdentifierScriptSync(scriptName, initialJsonPath, outputPath) {
         throw new Error(stderr);
     }
 }
-// --- END: NEW HELPER FUNCTION ---
 
 
 app.get('/healthcheck', (req, res) => {
     res.json({ status: "OK", timestamp: new Date() });
 });
 
-// --- THIS IS YOUR ORIGINAL, UNTOUCHED XCMS ENDPOINT ---
 app.post('/analyze/xcms', (req, res) => {
     if (!req.files || !req.files.file) {
         return res.status(400).json({ error: "No file was uploaded in a form field named 'file'." });
@@ -91,7 +88,6 @@ app.post('/analyze/xcms', (req, res) => {
 });
 
 
-// --- START: NEW IDENTIFICATION ENDPOINT (ADDITION ONLY) ---
 app.post('/analyze/xcms/identify', (req, res) => {
     // It no longer looks for a file, only the JSON body.
     if (!req.body || !req.body.initialAnalysisData) {
@@ -118,7 +114,6 @@ app.post('/analyze/xcms/identify', (req, res) => {
         if (fs.existsSync(tempOutputPath)) fs.unlinkSync(tempOutputPath);
     }
 });
-// --- END: NEW IDENTIFICATION ENDPOINT ---
 
 app.post('/analyze/drc', (req, res) => {
     const rawCsvData = req.body;
@@ -135,6 +130,27 @@ app.post('/analyze/drc', (req, res) => {
     } finally {
         if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
     }
+});
+
+app.post('/analyze/nmr', (req, res) => {
+    if (!req.files || !req.files.file) {
+        return res.status(400).json({ error: "No file was uploaded in a form field named 'file'." });
+    }
+    const file = req.files.file;
+    const tempFilePath = path.join(os.tmpdir(), `${uuidv4()}.zip`);
+    file.mv(tempFilePath, (err) => {
+        if (err) return res.status(500).json({ error: 'Failed to save uploaded file.', details: err });
+        try {
+            console.log("calling")
+            const results = runRScriptSync('nmr1d_analysis.R', tempFilePath);
+            res.json(results);
+        } catch (error) {
+            console.log(error.message)
+            res.status(500).json({ status: 'error', error: error.message });
+        } finally {
+            fs.unlinkSync(tempFilePath);
+        }
+    });
 });
 
 app.listen(port, () => {
