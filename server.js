@@ -11,12 +11,12 @@ const os = require('os');
 
 const app = express();
 const port = 8000;
-const MAX_FILE_SIZE = 300 * 1024 * 1024;
+const MAX_FILE_SIZE = 10 * 1024 * 1024;
 
 app.use(cors());
 app.use(fileUpload({ limits: { fileSize: MAX_FILE_SIZE } }));
 app.use(express.text({ type: ['text/csv', 'text/plain'] }));
-
+app.use(express.json())
 // --- THIS IS YOUR ORIGINAL, UNTOUCHED HELPER FUNCTION ---
 function runRScriptSync(scriptName, inputFilePath) {
     const scriptPath = path.join(__dirname, 'scripts', scriptName);
@@ -97,7 +97,7 @@ app.post('/analyze/xcms/identify', (req, res) => {
     if (!req.body || !req.body.initialAnalysisData) {
         return res.status(400).json({ error: "Missing 'initialAnalysisData' in the request body." });
     }
-    const initialDataString = req.body.initialAnalysisData;
+    const initialDataString = JSON.stringify(req.body.initialAnalysisData);
     
     const tempId = uuidv4();
     const tempInitialJsonPath = path.join(os.tmpdir(), `${tempId}_initial.json`);
