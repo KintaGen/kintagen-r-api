@@ -41,26 +41,6 @@ function runRScriptSync(scriptName, inputFilePath) {
 }
 
 
-function runIdentifierScriptSync(scriptName, initialJsonPath, outputPath) {
-    const scriptPath = path.join(__dirname, 'scripts', scriptName);
-    // Note the three arguments being passed
-    const command = `Rscript "${scriptPath}" "${initialJsonPath}" "${outputPath}"`;
-    console.log(`Executing identifier command: ${command}`);
-
-    try {
-        execSync(command, { stdio: 'pipe', timeout: 300000 });
-        const resultJson = fs.readFileSync(outputPath, 'utf-8');
-        // No need to clean up here, the 'finally' block in the endpoint will do it.
-        return JSON.parse(resultJson);
-    } catch (error) {
-        console.error(`Error executing R script: ${scriptName}`);
-        const stderr = error.stderr ? error.stderr.toString() : 'No stderr output.';
-        console.error('STDERR:', stderr);
-        throw new Error(stderr);
-    }
-}
-
-
 app.get('/healthcheck', (req, res) => {
     res.json({ status: "OK", timestamp: new Date() });
 });
@@ -87,33 +67,6 @@ app.post('/analyze/xcms', (req, res) => {
     });
 });
 
-
-app.post('/analyze/xcms/identify', (req, res) => {
-    // It no longer looks for a file, only the JSON body.
-    if (!req.body || !req.body.initialAnalysisData) {
-        return res.status(400).json({ error: "Missing 'initialAnalysisData' in the request body." });
-    }
-    const initialDataString = JSON.stringify(req.body.initialAnalysisData);
-    
-    const tempId = uuidv4();
-    const tempInitialJsonPath = path.join(os.tmpdir(), `${tempId}_initial.json`);
-    const tempOutputPath = path.join(os.tmpdir(), `${tempId}_matches.json`);
-
-    try {
-        // Write the data from the UI to a temporary file for the R script to read
-        fs.writeFileSync(tempInitialJsonPath, initialDataString);
-        
-        // Call the new, simpler helper function
-        const results = runIdentifierScriptSync('ms_identifier.R', tempInitialJsonPath, tempOutputPath);
-        res.json(results);
-    } catch (error) {
-        res.status(500).json({ status: 'error', error: error.message });
-    } finally {
-        // Clean up both temporary files
-        if (fs.existsSync(tempInitialJsonPath)) fs.unlinkSync(tempInitialJsonPath);
-        if (fs.existsSync(tempOutputPath)) fs.unlinkSync(tempOutputPath);
-    }
-});
 
 app.post('/analyze/drc', (req, res) => {
     const rawCsvData = req.body;
