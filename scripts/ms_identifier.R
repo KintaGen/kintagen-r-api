@@ -1,246 +1,187 @@
 # identifier.R
-# This script takes the output from feature_finder.R and a library file,
-# and performs only the spectral matching step.
+# This script is STATELESS. It takes the JSON output from the feature finder
+# (which includes embedded raw spectra) and a library file, and performs
+# spectral matching and generates validation plots.
 
+# Suppress package startup messages for cleaner logs
 suppressPackageStartupMessages({
   library(jsonlite)
   library(Spectra)
   library(dplyr)
   library(MetaboAnnotation)
-  library(MsBackendMsp)
-  library(ggplot2)    # Now needed for plotting
-  library(patchwork)  # For combining plots
+  library(MsBackendMsp) 
+  library(httr)
 })
 
-source("./scripts/helpers.R")
+# Make the source path robust to where the script is called from
+source('./scripts/helpers.R')
 
-perform_identification <- function(input_json_path, library_path) {
+fetch_candidates_from_mona <- function(mz, tolerance = 0.5) {
+  mz_low <- mz - tolerance
+  mz_high <- mz + tolerance
   
-  output_data <- list(status = "processing", results = list(), error = NULL)
-  chunk_size <- 200
+  # This is the smarter query string. It filters by mass.
+  query_string <- paste0(
+    "exists(compound.metaData.name:'total exact mass' and compound.metaData.value>:", mz_low,
+    " and compound.metaData.value<:", mz_high, ")"
+  )
   
-  tryCatch({
-    # Step 1: Read the JSON data from the first script
-    log_message("Reading initial analysis data from JSON...")
-    initial_data <- fromJSON(input_json_path)
-    mzml_path <- initial_data$mzMl_file_path
-    top_features <- initial_data$results$top_features
-    if (is.null(mzml_path) || is.null(top_features)) {
-      stop("Input JSON is missing required 'mzMl_file_path' or 'top_features' data.")
-    }
-    
-    # Step 2: Load the necessary data
-    log_message("Loading original spectra from .mzML file...")
-    exp_spectra <- Spectra(mzml_path, backend = MsBackendMzR())
-    
-    log_message(paste("Loading reference library from:", library_path))
-    ref_lib <- Spectra(
-      readMsp(f = library_path, skip = 0, n = chunk_size), 
-      backend = MsBackendDataFrame()
+  encoded_query <- URLencode(query_string)
+  
+  # --- STEP 1: Get the total count of candidates ---
+  count_api_url <- paste0(
+    "https://mona.fiehnlab.ucdavis.edu/rest/spectra/search/count?query=",
+    encoded_query
+  )
+  
+  log_message(paste("Querying MoNA API for candidate count for m/z ~", round(mz, 2)))
+  
+  count_response <- GET(count_api_url)
+  if (http_status(count_response)$category != "Success") {
+    log_message("MoNA count API request failed.")
+    return(NULL)
+  }
+  
+  total_candidates <- as.integer(content(count_response, "text", encoding = "UTF-8"))
+  
+  if (is.na(total_candidates) || total_candidates == 0) {
+    log_message("MoNA API returned 0 candidates for this mass.")
+    return(NULL)
+  }
+  
+  log_message(paste("Found", total_candidates, "total candidates. Fetching all of them in pages..."))
+  
+  # --- STEP 2: Paginate through all results ---
+  # Define a page size. 500 is a reasonable number to be efficient without overloading the server.
+  page_size <- 500 
+  from_index <- 0
+  master_list_of_dfs <- list() # To store results from all pages
+  total_pages <- ceiling(total_candidates / page_size)
+  
+  while (from_index < total_candidates) {
+    current_page <- (from_index / page_size) + 1
+    log_message(paste("Fetching page", current_page, "of", total_pages, "... (records", from_index + 1, "to", min(from_index + page_size, total_candidates), ")"))
+
+    # Construct the API URL for the current page using 'from' and 'size'
+    api_url <- paste0(
+      "https://mona.fiehnlab.ucdavis.edu/rest/spectra/search?query=",
+      encoded_query,
+      "&size=", page_size,
+      "&from=", from_index
     )
     
-    # Step 3: Perform the matching
-    log_message("Performing spectral matching...")
-    initial_query_spectra <- exp_spectra[top_features$spectrum_index]
-    initial_query_spectra$peak_number <- top_features$peak_number
-    
-    non_empty_mask <- initial_query_spectra$peaksCount > 0
-    if (!any(non_empty_mask)) { stop("All selected spectra are empty.") }
-    
-    query_spectra_for_matching <- initial_query_spectra[non_empty_mask]
-    top_features_for_matching <- top_features[non_empty_mask, ]
-    
-    match_params <- MatchForwardReverseParam(requirePrecursor = FALSE, tolerance = 0.5, ppm = 0)
-    matches <- matchSpectra(query_spectra_for_matching, ref_lib, param = match_params)
-    
-    # --- START: FINAL, CORRECTED RESULT PROCESSING ---
-    log_message("Processing match results...")
-    
-    all_hits_df <- matchedData(matches)
-    all_hits_df <- as.data.frame(all_hits_df)
-    # Check if there were any matches at all
-    if(any(!is.na(all_hits_df$score))) {
-      successful_hits_df <- all_hits_df %>% filter(!is.na(score))
-      successful_hits_df$target_idx <- targetIndex(matches)
-      best_hits_df <- successful_hits_df %>%
-        group_by(peak_number) %>% slice_max(order_by = score, n = 1, with_ties = FALSE) %>% ungroup() %>%
-        transmute(peak_number = as.integer(peak_number), match_name = target_Name, similarity_score = round(score, 3), target_idx = target_idx)
-      final_matches <- top_features_for_matching %>% select(peak_number) %>%
-        left_join(best_hits_df, by = "peak_number") %>%
-        mutate(match_name = ifelse(is.na(match_name), "No match found", match_name), similarity_score = ifelse(is.na(similarity_score), 0, similarity_score))
-    } else {
-      final_matches <- top_features_for_matching %>% select(peak_number) %>% mutate(match_name = "No match found", similarity_score = 0)
+    response <- GET(api_url)
+    if (http_status(response)$category != "Success") {
+      log_message(paste("API request failed for page", current_page, ". Aborting fetch."))
+      # We return NULL here because the data would be incomplete and potentially misleading.
+      return(NULL)
     }
-    output_data$results$library_matches <- final_matches
     
-    # --- Step 5: Generate Stacked Plots for Confident Matches ---
-    confident_hits <- final_matches %>% filter(similarity_score > 0.7)
-    if (nrow(confident_hits) > 0) {
-      log_message(paste("Generating", nrow(confident_hits), "stacked validation plots..."))
-      plot_list <- list()
+    api_results_df <- fromJSON(content(response, "text", encoding = "UTF-8"))
+    
+    if (is.null(api_results_df) || nrow(api_results_df) == 0) {
+      log_message(paste("Received an empty page (page", current_page, ") unexpectedly. Stopping fetch."))
+      break # Exit the loop if a page is empty
+    }
+    
+    # --- STEP 3: Process the results from the current page ---
+    for (i in 1:nrow(api_results_df)) {
+      hit <- api_results_df[i, ]
       
-      for (i in 1:nrow(confident_hits)) {
-        hit <- confident_hits[i, ]
-        hit_details <- best_hits_df %>% filter(peak_number == hit$peak_number)
-        
-        if (nrow(hit_details) > 0 && !is.na(hit_details$target_idx)) {
-          query_spec <- query_spectra_for_matching[query_spectra_for_matching$peak_number == hit$peak_number]
-          target_spec_lazy <- ref_lib[hit_details$target_idx]
-          target_spec <- setBackend(target_spec_lazy, MsBackendDataFrame())
-          
-          query_peaks_list <- peaksData(query_spec)
-          target_peaks_list <- peaksData(target_spec)
-          
-          if (length(query_peaks_list) > 0 && nrow(query_peaks_list[[1]]) > 0 && 
-              length(target_peaks_list) > 0 && nrow(target_peaks_list[[1]]) > 0) {
-            
-            # --- START: NEW PUBLICATION-QUALITY PLOT LOGIC ---
-            all_query_peaks <- as.data.frame(query_peaks_list[[1]]) %>% mutate(intensity = 100 * intensity / max(intensity, na.rm = TRUE))
-            all_target_peaks <- as.data.frame(target_peaks_list[[1]]) %>% mutate(intensity = 100 * intensity / max(intensity, na.rm = TRUE))
-            
-            matched_pairs <- joinPeaks(query_peaks_list[[1]], target_peaks_list[[1]], tolerance = 0.5, ppm = 0)
-            
-            matched_query_peaks <- data.frame(mz=numeric(), intensity=numeric())
-            matched_target_peaks <- data.frame(mz=numeric(), intensity=numeric())
-            
-            if (is.matrix(matched_pairs) && nrow(matched_pairs) > 0) {
-              matched_query_peaks <- data.frame(mz = matched_pairs[, "x.mz"], intensity = 100 * matched_pairs[, "x.intensity"] / max(query_peaks_list[[1]][,2], na.rm=TRUE))
-              matched_target_peaks <- data.frame(mz = matched_pairs[, "y.mz"], intensity = 100 * matched_pairs[, "y.intensity"] / max(target_peaks_list[[1]][,2], na.rm=TRUE))
-            }
-            
-            # --- Plot 1: Query (Experimental) Spectrum ---
-            p_query <- ggplot() +
-              # Draw all peaks in gray first as a background
-              geom_segment(data = all_query_peaks, aes(x = mz, y = 0, xend = mz, yend = intensity), color = "grey80", linewidth = 0.8) +
-              # Draw the matched peaks on top in blue
-              geom_segment(data = matched_query_peaks, aes(x = mz, y = 0, xend = mz, yend = intensity), color = "steelblue", linewidth = 1.2) +
-              # Add text labels for matched peaks
-              geom_text(data = matched_query_peaks, aes(x = mz, y = intensity, label = round(mz, 1)), angle = 45, hjust = -0.1, vjust = -0.2, size = 2.8) +
-              labs(title = paste("Experimental Spectrum (Peak #", hit$peak_number, ")"), x = NULL, y = "Rel. Intensity (%)") +
-              coord_cartesian(ylim = c(0, 25), expand = FALSE) + # More headroom for labels
-              theme_bw() +
-              theme(plot.title = element_text(face = "bold"))
-            
-            # --- Plot 2: Library (Reference) Spectrum ---
-            p_library <- ggplot() +
-              geom_segment(data = all_target_peaks, aes(x = mz, y = 0, xend = mz, yend = intensity), color = "grey80", linewidth = 0.8) +
-              geom_segment(data = matched_target_peaks, aes(x = mz, y = 0, xend = mz, yend = intensity), color = "darkred", linewidth = 1.2) +
-              geom_text(data = matched_target_peaks, aes(x = mz, y = intensity, label = round(mz, 1)), angle = 45, hjust = -0.1, vjust = -0.2, size = 2.8) +
-              labs(title = paste("Library Reference:", hit$match_name), x = "m/z", y = "Rel. Intensity (%)") +
-              coord_cartesian(ylim = c(0, 10), expand = FALSE) +
-              theme_bw() +
-              theme(plot.title = element_text(face = "bold"))
-            
-            # --- Combine Plots with Patchwork ---
-            combined_plot_for_hit <- p_query / p_library + 
-              plot_annotation(
-                title = "Spectral Match Validation",
-                subtitle = paste("Similarity Score:", hit$similarity_score)
-              ) & theme(plot.title = element_text(hjust = 0.5), plot.subtitle = element_text(hjust = 0.5))
-            
-            plot_list[[i]] <- combined_plot_for_hit
-            # --- END: NEW PUBLICATION-QUALITY PLOT LOGIC ---
-          }
-        }
+      if (is.null(hit$spectrum) || !is.character(hit$spectrum) || nchar(hit$spectrum) == 0) {
+        next 
       }
       
-      if (length(plot_list) > 0) {
-        final_plot <- wrap_plots(plot_list, ncol = 1)
-        output_data$results$match_plots_b64 <- gg_to_base64(final_plot, height = 7 * length(plot_list), width = 10)
+      peaks <- strsplit(hit$spectrum, " ")[[1]]
+      pks_matrix <- do.call(rbind, lapply(peaks, function(p) as.numeric(strsplit(p, ":")[[1]])))
+      if (is.null(pks_matrix) || nrow(pks_matrix) == 0) next
+      colnames(pks_matrix) <- c("mz", "intensity")
+      
+      compound_name <- "Unknown"
+      if (length(hit$compound[[1]]) > 0 && length(hit$compound[[1]]$names[[1]]) > 0) {
+        compound_name <- hit$compound[[1]]$names[[1]]$name[1]
       }
-    } else {
-      log_message("No confident matches to plot.")
+      
+      # Add the processed DataFrame to our master list
+      master_list_of_dfs[[length(master_list_of_dfs) + 1]] <- DataFrame(msLevel = 2L, name = compound_name, pks = list(pks_matrix))
+    }
+    
+    # Increment 'from' for the next page
+    from_index <- from_index + page_size
+  } # End of while loop
+  
+  
+  # --- STEP 4: Combine all pages and return the final Spectra object ---
+  if (length(master_list_of_dfs) == 0) {
+    log_message("Processing completed, but no valid spectrum data was found across all pages.")
+    return(NULL)
+  }
+  
+  log_message(paste("Successfully fetched and processed", length(master_list_of_dfs), "valid spectra from MoNA."))
+  combined_df <- do.call(rbind, master_list_of_dfs)
+  return(Spectra(combined_df, backend = MsBackendDataFrame()))
+}
+
+
+perform_identification <- function(input_json_path) {
+  
+  output_data <- list(status = "processing", results = list(), error = NULL)
+  
+  tryCatch({
+    log_message("Reading single spectrum data from JSON...")
+    # The input JSON is the simple object for one peak
+    spec_info <- fromJSON(input_json_path, simplifyDataFrame = TRUE)
+    
+    # <<< --- THIS IS THE FINAL, CORRECT LOGIC --- >>>
+    if (is.null(spec_info$peak_number) || is.null(spec_info$spectrum_data)) {
+      stop("Input JSON is missing required 'peak_number' or 'spectrum_data'.")
     }
 
-    log_message("Library matching complete.")
+    peak_num <- spec_info$peak_number[1] 
     
-    output_data$results$library_matches <- final_matches
-    # --- END: FINAL, CORRECTED RESULT PROCESSING ---
+    # The 'spectrum_data' column is a list-column. We need to extract
+    # the data.frame from the first element of that list with [[1]].
+    query_pks_matrix <- as.matrix(spec_info$spectrum_data[[1]])
+    # <<< --- END OF CORRECTION --- >>>
     
-    # --- Step 5: Generate Mirror Plots for Confident Matches ---
-    confident_hits <- final_matches %>% filter(similarity_score > 0.7)
-    
-    for (i in 1:nrow(confident_hits)) {
-      hit <- confident_hits[i, ]
-      hit_details <- best_hits_df %>% filter(peak_number == hit$peak_number)
+    if (nrow(query_pks_matrix) == 0) {
+      final_match <- data.frame(peak_number = peak_num, match_name = "No Peaks in Query", similarity_score = 0)
+    } else {
+      # The UI sends 'relative_intensity', but matching functions need 'intensity'.
+      colnames(query_pks_matrix) <- c("mz", "intensity")
       
-      if (nrow(confident_hits) > 0) {
-        log_message(paste("Generating", nrow(confident_hits), "overlaid plots..."))
-        plot_list <- list()
-        
-        for (i in 1:nrow(confident_hits)) {
-          hit <- confident_hits[i, ]
-          hit_details <- best_hits_df %>% filter(peak_number == hit$peak_number)
-          
-          if (nrow(hit_details) > 0 && !is.na(hit_details$target_idx)) {
-            query_spec <- query_spectra_for_matching[query_spectra_for_matching$peak_number == hit$peak_number]
-            target_spec_lazy <- ref_lib[hit_details$target_idx]
-            target_spec <- setBackend(target_spec_lazy, MsBackendDataFrame())
-            
-            query_peaks_list <- peaksData(query_spec)
-            target_peaks_list <- peaksData(target_spec)
-            
-            if (length(query_peaks_list) > 0 && nrow(query_peaks_list[[1]]) > 0 && 
-                length(target_peaks_list) > 0 && nrow(target_peaks_list[[1]]) > 0) {
-              
-              # --- START: NEW OVERLAID PLOT LOGIC ---
-              query_peaks <- as.data.frame(query_peaks_list[[1]]) %>%
-                mutate(intensity = 100 * intensity / max(intensity, na.rm = TRUE), source = "Query (Experiment)")
-              
-              # Both spectra now have POSITIVE intensity
-              target_peaks <- as.data.frame(target_peaks_list[[1]]) %>%
-                mutate(intensity = 100 * intensity / max(intensity, na.rm = TRUE), source = "Library (Reference)")
-              
-              combined_peaks <- rbind(query_peaks, target_peaks)
-              
-              # --- Plot 1: Query Spectrum ---
-              p_query <- ggplot() +
-                geom_segment(data = all_query_peaks, aes(x = mz, y = 0, xend = mz, yend = intensity), color = "gray80", linewidth = 0.8) +
-                geom_segment(data = matched_query_peaks, aes(x = mz, y = 0, xend = mz, yend = intensity), color = "steelblue", linewidth = 1.2) +
-                geom_text(data = matched_query_peaks, aes(x = mz, y = intensity, label = round(mz, 2)), angle = 60, hjust = 0, vjust = -0.2, size = 2.5) +
-                labs(title = "Query Spectrum (Experiment)", x = NULL, y = "Rel. Intensity (%)") +
-                coord_cartesian(ylim = c(0, 120)) +
-                theme_bw()
-              
-              # --- Plot 2: Library Spectrum ---
-              p_library <- ggplot() +
-                geom_segment(data = all_target_peaks, aes(x = mz, y = 0, xend = mz, yend = intensity), color = "gray80", linewidth = 0.8) +
-                geom_segment(data = matched_target_peaks, aes(x = mz, y = 0, xend = mz, yend = intensity), color = "darkred", linewidth = 1.2) +
-                geom_text(data = matched_target_peaks, aes(x = mz, y = intensity, label = round(mz, 2)), angle = 60, hjust = 0, vjust = -0.2, size = 2.5) +
-                labs(title = "Library Spectrum (Reference)", x = "m/z", y = "Rel. Intensity (%)") +
-                coord_cartesian(ylim = c(0, 120)) +
-                theme_bw()
-              
-              # --- Combine Plots with Patchwork ---
-              combined_plot_for_hit <- p_query / p_library + 
-                plot_annotation(
-                  title = paste("Peak #", hit$peak_number, ": ", hit$match_name),
-                  subtitle = paste("Similarity Score:", hit$similarity_score)
-                )
-              
-              plot_list[[i]] <- combined_plot_for_hit
-              # --- END: NEW OVERLAID PLOT LOGIC ---
-            }
-          }
-        } # end for loop
-        
-        if (length(plot_list) > 0) {
-          combined_plot <- wrap_plots(plot_list, ncol = 1)
-          output_data$results$match_plots_b64 <- gg_to_base64(combined_plot, height = 4 * length(plot_list), width = 8)
-        }
+      molecular_ion_mz <- max(query_pks_matrix[, "mz"])
+      candidate_lib <- fetch_candidates_from_mona(molecular_ion_mz)
+      
+      if (is.null(candidate_lib)) {
+        final_match <- data.frame(peak_number = peak_num, match_name = "No API Candidates", similarity_score = 0)
       } else {
-        log_message("No confident matches to plot.")
+        query_spec <- Spectra(S4Vectors::DataFrame(pks = list(query_pks_matrix)), backend = MsBackendDataFrame())
+        match_params <- MatchForwardReverseParam(requirePrecursor = FALSE, tolerance = 0.5, ppm = 0)
+        matches <- matchSpectra(query_spec, candidate_lib, param = match_params)
+        all_hits_df <- as.data.frame(matchedData(matches))
+        
+        if (any(!is.na(all_hits_df$score))) {
+          best_hit <- all_hits_df %>% filter(!is.na(score)) %>% slice_max(order_by = score, n = 1)
+          final_match <- data.frame(
+            peak_number = peak_num,
+            match_name = best_hit$target_name,
+            similarity_score = round(best_hit$score, 3)
+          )
+        } else {
+          final_match <- data.frame(peak_number = peak_num, match_name = "No Match Found", similarity_score = 0)
+        }
       }
-    } # end for loop
+    }
     
+    output_data$results$library_matches <- final_match
     output_data$status <- "success"
-    log_message("Identification complete.")
-    
+    log_message("Single peak identification complete.")
+
   }, error = function(e) {
     output_data$status <<- "error"; output_data$error <<- e$message
   })
   
-  # Corrected the return variable name
   return(output_data)
 }
 
@@ -248,15 +189,16 @@ perform_identification <- function(input_json_path, library_path) {
 if (!interactive()) {
   tryCatch({
     args <- commandArgs(trailingOnly = TRUE)
-    if (length(args) != 3) {
-      stop("Usage: Rscript identifier.R <input_results.json> <library_file> <output_matches.json>")
+    if (length(args) != 2) {
+      stop("Usage: Rscript identifier.R <input_results.json> <output_matches.json>")
     }
-    input_json <- args[1]; library_file <- args[2]; output_json <- args[3]
-    result <- perform_identification(input_json_path = input_json, library_path = library_file)
+    input_json <- args[1]; output_json <- args[2]
+    cat(input_json)
+    result <- perform_identification(input_json_path = input_json)
     json_output <- toJSON(result, auto_unbox = TRUE, pretty = TRUE)
     write(json_output, file = output_json)
   }, error = function(e) {
-    error_json <- toJSON(list(status = "error", error = e$message), auto_unbox = TRUE)
+    error_json <- toJSON(list(status = "error", error = e), auto_unbox = TRUE)
     try(write(error_json, file = commandArgs(trailingOnly=TRUE)[3]), silent = TRUE)
     quit(status = 1)
   })

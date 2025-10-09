@@ -5,16 +5,15 @@ suppressPackageStartupMessages({
   library(mzR)
   library(dplyr)
   library(tidyr)
-  library(MsCoreUtils) # For smooth() and coefSG()
+  library(MsCoreUtils)
 })
 
-source("./scripts/helpers.R")
+source('./scripts/helpers.R')
 
-perform_feature_analysis <- function(mzMl_file_path, noise_threshold_percent = 35.0) {
+perform_feature_analysis <- function(mzMl_file_path, noise_threshold_percent = 2.5) {
   
   output_data <- list(
     status = "processing",
-    mzMl_file_path = mzMl_file_path,
     results = list(),
     error = NULL
   )
@@ -31,11 +30,11 @@ perform_feature_analysis <- function(mzMl_file_path, noise_threshold_percent = 3
     )
   }
   
+  # Advanced peak detection and integration function
   detect_and_integrate_peaks <- function(rt, intensity, noise_thresh,
                                          min_width_sec = 3, min_prominence = NULL) {
     stopifnot(length(rt) == length(intensity))
     
-    # Local maxima (2nd-derivative sign change)
     is_peak <- which(diff(sign(diff(intensity))) == -2) + 1
     apexes <- is_peak[intensity[is_peak] > noise_thresh]
     if (length(apexes) == 0) return(empty_peaks_df())
@@ -55,7 +54,6 @@ perform_feature_analysis <- function(mzMl_file_path, noise_threshold_percent = 3
       right_idx <- get_valley(apex_idx,  1)
       if (left_idx >= right_idx) return(NULL)
       
-      # width & prominence filters
       width_sec <- rt[right_idx] - rt[left_idx]
       if (!is.null(min_width_sec) && width_sec < min_width_sec) return(NULL)
       
@@ -64,7 +62,6 @@ perform_feature_analysis <- function(mzMl_file_path, noise_threshold_percent = 3
       prom <- intensity[apex_idx] - max(left_min, right_min)
       if (!is.null(min_prominence) && prom < min_prominence) return(NULL)
       
-      # integrate (trapezoid)
       peak_indices <- left_idx:right_idx
       peak_rt <- rt[peak_indices]; peak_int <- intensity[peak_indices]
       if (length(peak_rt) < 2) return(NULL)
@@ -97,7 +94,6 @@ perform_feature_analysis <- function(mzMl_file_path, noise_threshold_percent = 3
     smoothed_chrom_data <- raw_chrom_data
     smoothed_chrom_data$intensity <- smoothed_intensity
     
-    # Threshold as % of smoothed max (same semantics as your original)
     max_intensity_smoothed <- max(smoothed_intensity, na.rm = TRUE)
     absolute_noise_threshold <- max_intensity_smoothed * (noise_threshold_percent / 100)
     
@@ -105,8 +101,9 @@ perform_feature_analysis <- function(mzMl_file_path, noise_threshold_percent = 3
     all_peaks_numbered <- detect_and_integrate_peaks(
       smoothed_chrom_data$rt_sec, smoothed_chrom_data$intensity, absolute_noise_threshold
     )
-    # Safe even if empty because columns exist
-    all_peaks_numbered <- all_peaks_numbered %>% arrange(rt_apex) %>% mutate(peak_number = dplyr::row_number())
+    if (nrow(all_peaks_numbered) > 0) {
+        all_peaks_numbered <- all_peaks_numbered %>% arrange(rt_apex) %>% mutate(peak_number = dplyr::row_number())
+    }
     
     log_message(paste("Successfully integrated and numbered", nrow(all_peaks_numbered), "peaks."))
     output_data$results$integrated_peaks <- all_peaks_numbered
@@ -117,15 +114,15 @@ perform_feature_analysis <- function(mzMl_file_path, noise_threshold_percent = 3
   })
   if (!is.null(output_data$error)) return(output_data)
   
-  # --- 2. QUANTITATIVE REPORT & TOP FEATURE SELECTION ---
+  # --- 2. QUANTITATIVE REPORT & SPECTRA DATA EXTRACTION ---
   tryCatch({
     log_message("Generating quantitative report...")
     all_peaks_numbered <- output_data$results$integrated_peaks
     
     if (nrow(all_peaks_numbered) == 0) {
-      log_message("No peaks were found. Skipping report generation.")
+      log_message("No peaks were found. Skipping report and spectra extraction.")
       output_data$results$quantitative_report <- data.frame()
-      output_data$results$top_features <- data.frame()
+      output_data$results$top_spectra_data <- list()
     } else {
       total_area <- sum(all_peaks_numbered$peak_area, na.rm = TRUE)
       output_data$results$quantitative_report <- all_peaks_numbered %>%
@@ -137,13 +134,10 @@ perform_feature_analysis <- function(mzMl_file_path, noise_threshold_percent = 3
         ) %>%
         select(peak_number, rt_minutes, peak_area, area_percent)
       
-      log_message("Identifying spectra for the top 50 most intense peaks...")
+      log_message("Identifying and extracting spectra for the top 50 most intense peaks...")
       top_50_peaks_data <- all_peaks_numbered %>% arrange(desc(peak_height)) %>% head(50)
       
-      if (nrow(top_50_peaks_data) == 0) {
-        output_data$results$top_features <- data.frame()
-      } else {
-        # map each apex to nearest spectrum by RT
+      if (nrow(top_50_peaks_data) > 0) {
         spec_rt <- rtime(exp_spectra)
         top_features <- top_50_peaks_data %>%
           rowwise() %>%
@@ -151,6 +145,37 @@ perform_feature_analysis <- function(mzMl_file_path, noise_threshold_percent = 3
           ungroup() %>%
           select(peak_number, spectrum_index)
         output_data$results$top_features <- top_features
+
+        top_spectra_objects <- exp_spectra[top_features$spectrum_index]
+        peaks_list <- peaksData(top_spectra_objects)
+        
+        spectra_results_list <- lapply(1:nrow(top_features), function(i) {
+          spec_df <- as.data.frame(peaks_list[[i]])
+          if (ncol(spec_df) >= 2) {
+              colnames(spec_df)[1:2] <- c("mz", "intensity")
+              if(nrow(spec_df) > 0 && max(spec_df$intensity, na.rm=TRUE) > 0) {
+                spec_df <- spec_df %>%
+                    mutate(relative_intensity = (intensity / max(intensity, na.rm = TRUE)) * 100) %>%
+                    filter(relative_intensity >= 1.0) %>%
+                    select(mz, relative_intensity)
+              } else {
+                spec_df <- data.frame(mz=numeric(), relative_intensity=numeric())
+              }
+          } else {
+             spec_df <- data.frame(mz=numeric(), relative_intensity=numeric())
+          }
+          list(
+            peak_number = top_features$peak_number[i],
+            spectrum_data = spec_df
+          )
+        })
+        
+        # <<< --- THIS IS THE FIX --- >>>
+        # Use the name 'top_spectra_data' that the UI is expecting.
+        output_data$results$top_spectra_data <- spectra_results_list
+
+      } else {
+        output_data$results$top_spectra_data <- list()
       }
     }
   }, error = function(e) {
@@ -158,65 +183,11 @@ perform_feature_analysis <- function(mzMl_file_path, noise_threshold_percent = 3
   })
   if (!is.null(output_data$error)) return(output_data)
   
-  # --- 3. EXTRACT TOP 50 MASS SPECTRA DATA ---
-  tryCatch({
-    log_message("Extracting mass spectra data for top 50 peaks...")
-    top_features_data <- output_data$results$top_features
-    
-    if (!is.null(top_features_data) && nrow(top_features_data) > 0) {
-      top_spectra <- exp_spectra[top_features_data$spectrum_index]
-      peaks_list <- peaksData(top_spectra)
-      
-      spectra_results_list <- lapply(seq_len(nrow(top_features_data)), function(i) {
-        peak_num <- top_features_data$peak_number[i]
-        pk <- peaks_list[[i]]
-        
-        if (is.null(pk) || length(pk) == 0) {
-          spec_data <- data.frame(mz = numeric(), relative_intensity = numeric())
-        } else {
-          spec_df <- as.data.frame(pk)
-          # Ensure there are at least two cols
-          if (ncol(spec_df) < 2) {
-            spec_data <- data.frame(mz = numeric(), relative_intensity = numeric())
-          } else {
-            colnames(spec_df)[1:2] <- c("mz", "intensity")
-            if (nrow(spec_df) > 0 && max(spec_df$intensity, na.rm = TRUE) > 0) {
-              spec_data <- spec_df %>%
-                mutate(relative_intensity = (intensity / max(intensity, na.rm = TRUE)) * 100) %>%
-                filter(relative_intensity >= 1.0) %>%
-                select(mz, relative_intensity)
-            } else {
-              spec_data <- data.frame(mz = numeric(), relative_intensity = numeric())
-            }
-          }
-        }
-        list(peak_number = peak_num, spectrum_data = spec_data)
-      })
-      
-      output_data$results$top_spectra_data <- spectra_results_list
-    } else {
-      log_message("No top features found to extract spectra.")
-      output_data$results$top_spectra_data <- list()
-    }
-  }, error = function(e) {
-    log_message(paste("Warning: Could not extract top spectra data:", e$message))
-    output_data$results$top_spectra_data <- list()
-  })
-
-  # --- 4. FINALIZE AND RETURN ---
-  # These use objects produced in the first tryCatch; if that failed, we'd have already returned.
-  output_data$results$raw_chromatogram_data <-
-    raw_chrom_data %>% mutate(rt_min = rt_sec/60) %>% select(rt_min, intensity)
-  output_data$results$smoothed_chromatogram_data <-
-    output_data$results$smoothed_chrom_data_internal %>% mutate(rt_min = rt_sec/60) %>% select(rt_min, intensity)
-  output_data$results$integrated_peaks_details <-
-    output_data$results$integrated_peaks %>%
-      mutate(
-        rt_apex_min = rt_apex/60,
-        rt_start_min = rt_start/60,
-        rt_end_min = rt_end/60,
-        peak_height = peak_height
-      )
+  # --- 3. FINALIZE AND RETURN ---
+  output_data$results$raw_chromatogram_data <- raw_chrom_data %>% mutate(rt_min = rt_sec/60) %>% select(rt_min, intensity)
+  output_data$results$smoothed_chromatogram_data <- output_data$results$smoothed_chrom_data_internal %>% mutate(rt_min = rt_sec/60) %>% select(rt_min, intensity)
+  output_data$results$integrated_peaks_details <- output_data$results$integrated_peaks %>%
+      mutate(rt_apex_min = rt_apex/60, rt_start_min = rt_start/60, rt_end_min = rt_end/60, peak_height = peak_height)
   
   # Clean internals
   output_data$results$integrated_peaks <- NULL
@@ -231,11 +202,10 @@ if (!interactive()) {
   tryCatch({
     args <- commandArgs(trailingOnly = TRUE)
     if (length(args) < 2 || length(args) > 3) {
-      stop("Usage: Rscript feature_finder.R <input.mzML> <output.json> [noise_threshold_percent]")
+      stop("Usage: Rscript xcms_analysis.R <input.mzML> <output.json> [noise_threshold_percent]")
     }
-    input_path <- args[1]
-    output_path <- args[2]
-    noise_thresh <- if (length(args) == 3) as.numeric(args[3]) else 1.0
+    input_path <- args[1]; output_path <- args[2]
+    noise_thresh <- if (length(args) == 3) as.numeric(args[3]) else 3
     
     result <- perform_feature_analysis(mzMl_file_path = input_path, noise_threshold_percent = noise_thresh)
     json_output <- toJSON(result, auto_unbox = TRUE, pretty = TRUE)
