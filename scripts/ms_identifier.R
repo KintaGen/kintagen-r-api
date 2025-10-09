@@ -132,17 +132,14 @@ perform_identification <- function(input_json_path) {
     # The input JSON is the simple object for one peak
     spec_info <- fromJSON(input_json_path, simplifyDataFrame = TRUE)
     
-    # <<< --- THIS IS THE FINAL, CORRECT LOGIC --- >>>
     if (is.null(spec_info$peak_number) || is.null(spec_info$spectrum_data)) {
       stop("Input JSON is missing required 'peak_number' or 'spectrum_data'.")
     }
 
-    peak_num <- spec_info$peak_number[1] 
+    peak_num <- spec_info$peak_number 
     
-    # The 'spectrum_data' column is a list-column. We need to extract
-    # the data.frame from the first element of that list with [[1]].
-    query_pks_matrix <- as.matrix(spec_info$spectrum_data[[1]])
-    # <<< --- END OF CORRECTION --- >>>
+
+    query_pks_matrix <- as.matrix(as.data.frame(spec_info$spectrum_data))
     
     if (nrow(query_pks_matrix) == 0) {
       final_match <- data.frame(peak_number = peak_num, match_name = "No Peaks in Query", similarity_score = 0)
