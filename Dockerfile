@@ -33,7 +33,7 @@ RUN R -e '                                                               \
     ));                                                                  \
     BiocManager::install(c(                                              \
         "impute", "MassSpecWavelet", "pcaMethods",                       \
-        "Spectra","mzR"                                                  \
+        "Spectra","mzR","xcms","MsExperiment","ProtGenerics"                                                  \
     ), update=FALSE);                                                    \
 '
 
