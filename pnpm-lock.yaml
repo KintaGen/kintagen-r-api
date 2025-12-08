@@ -27,6 +27,9 @@ importers:
         specifier: 0.0.1-security
         version: 0.0.1-security
       os: {specifier: ^0.1.2, version: 0.1.2}
+      p-limit:
+        specifier: ^7.2.0
+        version: 7.2.0
       path:
         specifier: ^0.12.7
         version: 0.12.7
@@ -261,6 +264,10 @@ packages:
   os@0.1.2:
     resolution: {integrity: sha512-ZoXJkvAnljwvc56MbvhtKVWmSkzV712k42Is2mA0+0KTSRakq5XXuXpjZjgAt9ctzl51ojhQWakQQpmOvXWfjQ==}
 
+  p-limit@7.2.0:
+    resolution: {integrity: sha512-ATHLtwoTNDloHRFFxFJdHnG6n2WUeFjaR8XQMFdKIv0xkXjrER8/iG9iu265jOM95zXHAfv9oTkqhrfbIzosrQ==}
+    engines: {node: '>=20'}
+
   parseurl@1.3.3:
     resolution: {integrity: sha512-CiyeOxFT/JZyN5m0z9PfXw4SCBJ6Sygz1Dpl0wqjlhDEGGBP1GnsUVEL0p63hoG1fcj3fHynXi9NYO4nWOL+qQ==}
     engines: {node: '>= 0.8'}
@@ -377,6 +384,10 @@ packages:
 
   wrappy@1.0.2:
     resolution: {integrity: sha512-l4Sp/DRseor9wL6EvV2+TuQn63dMkPjZ/sp9XkghTEbV9KlPS1xUsZ3u7/IQO4wxtcFB4bgpQPRcR3QCvezPcQ==}
+
+  yocto-queue@1.2.2:
+    resolution: {integrity: sha512-4LCcse/U2MHZ63HAJVE+v71o7yOdIe4cZ70Wpf8D/IyjDKYQLV5GD46B+hSTjJsvV5PztjvHoU580EftxjDZFQ==}
+    engines: {node: '>=12.20'}
 
 snapshots:
 
@@ -613,6 +624,10 @@ snapshots:
 
   os@0.1.2: {}
 
+  p-limit@7.2.0:
+    dependencies:
+      yocto-queue: 1.2.2
+
   parseurl@1.3.3: {}
 
   path-to-regexp@8.3.0: {}
@@ -744,3 +759,5 @@ snapshots:
   vary@1.1.2: {}
 
   wrappy@1.0.2: {}
+
+  yocto-queue@1.2.2: {}

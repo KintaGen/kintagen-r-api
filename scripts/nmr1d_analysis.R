@@ -321,7 +321,9 @@ perform_nmr_analysis <- function(zip_file_path, gg_to_base64_func = NULL) {
       "%s\n\nFunctional-group hints (by 1H band counts):\n%s",
       summary_text_ref, bullets
     )
-
+    log_message("Generating package citations...")
+    used_packages <- c("jsonlite", "Rnmr1D", "archive", "dplyr", "tidyr", "ggplot2")
+    output_data$results$package_citations <- get_package_citations(used_packages)
     output_data$status <- "success"
 
   }, error = function(e) {

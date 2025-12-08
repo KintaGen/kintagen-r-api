@@ -6,6 +6,7 @@ const path = require('path');
 const os = require('os');
 const { del } = require('@vercel/blob');
 const { pipeline } = require('node:stream/promises');
+const pLimit = require('p-limit');
 require('dotenv').config();
 
 const app = express();
@@ -19,13 +20,17 @@ app.use(express.json());
 /**
  * Runs an R script as a synchronous child process.
  * @param {string} scriptName - The name of the R script in the /scripts folder.
- * @param {string} inputFilePath - The path to the input data file.
+ * @param {string} inputFilePath - The path (or comma-separated paths) to the input data file(s).
  * @returns {object | undefined} - The parsed JSON object from the R script's output file, or undefined if it fails.
  */
 function runRScriptSync(scriptName, inputFilePath) {
     const scriptPath = path.join(__dirname, 'scripts', scriptName);
     const outputFilePath = path.join(os.tmpdir(), `${uuidv4()}.json`);
+    
+    // inputFilePath might be a comma-separated string of paths.
+    // We wrap it in quotes to handle spaces, but R script logic parses it.
     const command = `Rscript "${scriptPath}" "${inputFilePath}" "${outputFilePath}"`;
+    
     console.log(`Executing command: ${command}`);
     try {
         execSync(command, { stdio: 'pipe', timeout: 600000 }); // 10 minute timeout
@@ -34,7 +39,6 @@ function runRScriptSync(scriptName, inputFilePath) {
             fs.unlinkSync(outputFilePath);
             return JSON.parse(resultJson);
         } else {
-            // This case handles when the R script exits successfully but creates no output file.
             console.error(`R script '${scriptName}' finished but did not create an output file.`);
             return undefined;
         }
@@ -44,51 +48,51 @@ function runRScriptSync(scriptName, inputFilePath) {
         if (fs.existsSync(outputFilePath)) {
             fs.unlinkSync(outputFilePath);
         }
-        // Re-throw the error to be caught by the main handler
         throw new Error(stderr || `R script '${scriptName}' failed.`);
     }
 }
 
 /**
  * Downloads a file from a URL to a local path using native fetch.
- * @param {string} fileUrl - The public URL of the file to download.
- * @param {string} outputPath - The local path to save the file to.
+ * @param {string} fileUrl - The public URL of the file.
+ * @param {string} outputPath - The local path to save the file.
  */
 async function downloadFile(fileUrl, outputPath) {
     const response = await fetch(fileUrl);
     if (!response.ok) {
-        throw new Error(`Failed to download file: ${response.status} ${response.statusText}`);
+        throw new Error(`Failed to download file from ${fileUrl}: ${response.status} ${response.statusText}`);
     }
     await pipeline(response.body, fs.createWriteStream(outputPath));
 }
 
 /**
- * Deletes a file from Vercel Blob storage.
- * @param {string} fileUrl - The URL of the blob to delete.
+ * Deletes files from Vercel Blob storage.
+ * @param {string|string[]} fileUrls - A single URL or array/comma-separated string of URLs.
  */
-async function deleteFromBlob(fileUrl) {
-    try {
-        await del(fileUrl, { token: process.env.BLOB_READ_WRITE_TOKEN });
-        console.log(`Successfully deleted from Blob: ${fileUrl}`);
-    } catch (error) {
-        console.error(`Failed to delete from Blob: ${fileUrl}`, error);
+async function deleteFromBlob(fileUrls) {
+    // Convert comma-separated string or array to array
+    const urlsToDelete = Array.isArray(fileUrls) ? fileUrls : fileUrls.split(',');
+    
+    for (const url of urlsToDelete) {
+        if (!url) continue;
+        try {
+            await del(url.trim(), { token: process.env.BLOB_READ_WRITE_TOKEN });
+            console.log(`Successfully deleted from Blob: ${url}`);
+        } catch (error) {
+            console.error(`Failed to delete from Blob: ${url}`, error);
+        }
     }
 }
 
 /**
  * Sends the final job status back to the Vercel API.
- * @param {string} jobId - The ID of the job.
- * @param {'completed' | 'failed'} status - The final status.
- * @param {object} data - An object containing either a `result` or `error` property.
  */
 async function updateVercelStatus(jobId, status, data) {
     console.log(`[${jobId}] Updating Vercel status to: ${status}`);
     try {
         const response = await fetch(process.env.VERCEL_STATUS_UPDATE_URL, {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-            },
+            headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ jobId, status, ...data }),
         });
         if (!response.ok) {
@@ -100,22 +104,35 @@ async function updateVercelStatus(jobId, status, data) {
 }
 
 /**
- * Identifies a single GC-MS peak using the MoNA online database API.
- * @param {object} peakData - The peak data object from the XCMS script.
- * @returns {Promise<object>} - An object with the identification results.
+ * Identifies a single GC-MS peak using MoNA.
  */
 async function identifySinglePeak(peakData) {
+    // 1. Setup a timeout controller (fails request after 10 seconds)
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000);
+
     try {
-        const spectrumString = peakData.spectrum_data.map(p => `${p.mz.toFixed(4)}:${(p.relative_intensity || 0).toFixed(0)}`).join(" ");
+        const spectrumString = peakData.spectrum_data
+            .map(p => `${p.mz.toFixed(4)}:${(p.relative_intensity || 0).toFixed(0)}`)
+            .join(" ");
+            
         const payload = { spectrum: spectrumString, minSimilarity: 500, algorithm: "default" };
         
         const response = await fetch("https://mona.fiehnlab.ucdavis.edu/rest/similarity/search", {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: { 
+                'Content-Type': 'application/json',
+                'User-Agent': 'MassSpecWorker/1.0' // Good practice to avoid blocks
+            },
             body: JSON.stringify(payload),
+            signal: controller.signal // 2. Attach the abort signal here
         });
 
-        if (!response.ok) return null;
+        if (!response.ok) {
+            // If API returns 500, 404, etc., just return null
+            return null;
+        }
+
         const apiResults = await response.json();
         
         if (apiResults && apiResults.length > 0) {
@@ -134,9 +151,16 @@ async function identifySinglePeak(peakData) {
             };
         }
     } catch (error) {
-        console.error(`Failed to identify peak #${peakData.peak_number}:`, error);
+        // 3. Log the error simply, and return null so the job doesn't crash
+        console.warn(`Peak #${peakData.peak_number} failed/timeout: ${error.message}`);
+        return null; 
+    } finally {
+        // 4. Always clear the timer to prevent memory leaks
+        clearTimeout(timeoutId);
     }
-    return { peak_number: peakData.peak_number, match_name: "No Match Found", similarity_score: 0, library_spectrum: [] };
+
+    // Return null if no matches found
+    return null;
 }
 
 
@@ -148,29 +172,44 @@ app.post('/process-job', async (req, res) => {
         return res.status(401).send('Unauthorized');
     }
 
+    // `fileUrl` can now be a comma-separated string (e.g. "url1,url2") from the updated UI
     const { jobId, analysisType, fileUrl, originalFilename, inputDataHash } = req.body;
+    
     console.log(`[${jobId}] Received job. Type: ${analysisType}`);
     res.status(202).send('Accepted');
 
-    const tempFilePath = path.join(os.tmpdir(), `${uuidv4()}_${originalFilename}`);
+    // Parse inputs (handles single or multiple files)
+    const fileUrls = fileUrl.split(',');
+    const fileNames = originalFilename.split(',');
+    const downloadedFilePaths = [];
 
     try {
-        await downloadFile(fileUrl, tempFilePath);
-        console.log(`[${jobId}] File downloaded.`);
+        // --- DOWNLOAD STAGE ---
+        for (let i = 0; i < fileUrls.length; i++) {
+            const url = fileUrls[i].trim();
+            const name = fileNames[i] ? fileNames[i].trim() : `file_${i}.mzML`;
+            const localPath = path.join(os.tmpdir(), `${uuidv4()}_${name}`);
+            
+            console.log(`[${jobId}] Downloading file ${i + 1}/${fileUrls.length}: ${name}`);
+            await downloadFile(url, localPath);
+            downloadedFilePaths.push(localPath);
+        }
 
         const scriptMap = { 'xcms': 'xcms_analysis.R', 'drc': 'drc_analysis.R', 'nmr': 'nmr1d_analysis.R' };
         const scriptName = scriptMap[analysisType];
         if (!scriptName) throw new Error(`Invalid analysis type: ${analysisType}`);
 
-        // --- STAGE 1: Run R Script ---
-        const rScriptResults = runRScriptSync(scriptName, tempFilePath);
+        // Construct input argument for R (comma-separated local paths)
+        const rScriptInput = downloadedFilePaths.join(',');
 
-        // Add a robustness check to ensure the R script produced a valid result object.
+        // --- STAGE 1: Run R Script ---
+        console.log(`[${jobId}] Running R script on ${downloadedFilePaths.length} file(s)...`);
+        const rScriptResults = runRScriptSync(scriptName, rScriptInput);
+
         if (!rScriptResults || typeof rScriptResults !== 'object') {
             throw new Error('R script finished but did not produce a valid result object.');
         }
         
-        // Safely check the status property.
         if (rScriptResults.status !== 'success') {
             throw new Error(rScriptResults.error || 'The R script reported a failure.');
         }
@@ -179,11 +218,21 @@ app.post('/process-job', async (req, res) => {
         // --- STAGE 2: Run MoNA Identification (only for 'xcms' jobs) ---
         if (analysisType === 'xcms') {
             console.log(`[${jobId}] Stage 2 (MoNA Identification) starting...`);
-            const topSpectra = rScriptResults.results?.top_spectra_data || [];
+            
+            // 1. Get the full list from R results
+            const rawSpectra = rScriptResults.results?.top_spectra_data || [];
+            
+            // 2. FORCE LIMIT: Explicitly take only the first 50 items
+            // This protects your server if the R script returns 1000 peaks
+            const topSpectra = rawSpectra.slice(0, 50); 
+
+            console.log(`[${jobId}] Processing ${topSpectra.length} spectra (filtered from ${rawSpectra.length} total)...`);
+
+            const limit = pLimit.default(5);
             
             if (topSpectra.length > 0) {
                 const allMatches = await Promise.all(
-                    topSpectra.map(spec => identifySinglePeak(spec))
+                    topSpectra.map(spec => limit(() => identifySinglePeak(spec)))
                 );
                 rScriptResults.results.library_matches = allMatches.filter(Boolean);
             } else {
@@ -192,23 +241,24 @@ app.post('/process-job', async (req, res) => {
             console.log(`[${jobId}] Stage 2 (MoNA Identification) complete.`);
         }
         
-
-        
         await updateVercelStatus(jobId, 'completed', { result: rScriptResults });
 
     } catch (error) {
         console.error(`[${jobId}] JOB FAILED:`, error.message);
         await updateVercelStatus(jobId, 'failed', { error: error.message });
-        return;
     
     } finally {
-        if (fs.existsSync(tempFilePath)) {
-            fs.unlinkSync(tempFilePath);
-            console.log(`[${jobId}] Cleaned up local temp file.`);
+        // Cleanup local temp files
+        for (const filePath of downloadedFilePaths) {
+            if (fs.existsSync(filePath)) {
+                fs.unlinkSync(filePath);
+            }
         }
+        console.log(`[${jobId}] Cleaned up local temp files.`);
+        
+        // Cleanup Blob storage
+        await deleteFromBlob(fileUrl);
     }
-
-    await deleteFromBlob(fileUrl);
 });
 
 app.get('/healthcheck', (req, res) => res.json({ status: "OK" }));

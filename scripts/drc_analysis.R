@@ -89,7 +89,9 @@ perform_drc_analysis <- function(input_csv_string) {
     output_data$status <<- "error"
     output_data$error <<- e$message
   })
-
+  log_message("Generating package citations...")
+  used_packages <- c("jsonlite", "drc", "ggplot2")
+  output_data$results$package_citations <- get_package_citations(used_packages)
   # --- 4. FINALIZE AND RETURN ---
   if (is.null(output_data$error)) {
     output_data$status <- "success"
